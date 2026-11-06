@@ -18,7 +18,7 @@ def transform_points(points: np.ndarray, T_target_source: np.ndarray) -> np.ndar
     return points @ T_target_source[:3, :3].T + T_target_source[:3, 3]
 
 
-def _in_bounds(pixels: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+def in_bounds(pixels: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     height, width = shape
     u, v = np.moveaxis(pixels, -1, 0)
     tolerance = 1e-9
@@ -35,7 +35,7 @@ def project_points(
     positive = np.isfinite(points).all(axis=-1) & (depth > 0)
     pixels = np.full((*depth.shape, 2), np.nan)
     pixels[positive] = (points[positive] @ K.T)[:, :2] / depth[positive, None]
-    return Projection(pixels, depth, positive, _in_bounds(pixels, image_shape))
+    return Projection(pixels, depth, positive, in_bounds(pixels, image_shape))
 
 
 def reproject_depth(
@@ -103,7 +103,7 @@ def evaluate_pair(
     if flow_valid_mask is not None:
         valid_flow &= flow_valid_mask
     candidate = valid_depth & valid_flow & static_mask & visible_mask
-    candidate &= projection.in_bounds & _in_bounds(flow_target, shape)
+    candidate &= projection.in_bounds & in_bounds(flow_target, shape)
     sampled_depth = _sample_depth(target_depth, projection.pixels[candidate])
     valid = candidate.copy()
     valid[candidate] = np.isfinite(sampled_depth) & (sampled_depth > 0)
