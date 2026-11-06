@@ -1,4 +1,4 @@
-"""Generate frame-level Flow–Geometry and depth reprojection reports for Sintel."""
+"""Generate frame-level cross-modal consistency reports for Sintel."""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ from PIL import Image
 from .geometry.backproject import pixel_grid
 from .geometry.reprojection import Projection, in_bounds, reproject_depth
 from .geometry.visibility import DepthReprojection, Visibility, evaluate_depth
+from .rgb_flow import CHARBONNIER_EPSILON, RGBFlowResult, compute_rgb_flow_consistency
 from .sintel import FramePair, iter_frame_pairs
 
 
@@ -46,6 +47,20 @@ def save_map(path: Path, errors: np.ndarray, ceiling: float) -> None:
     level = np.clip(errors[valid] / ceiling, 0, 1)
     colors[valid] = np.column_stack((255 * level, np.full(level.shape, 32), 255 * (1 - level)))
     Image.fromarray(colors).save(path)
+
+
+def summarize_rgb_flow(result: RGBFlowResult, region: np.ndarray | None = None) -> dict:
+    error, identity = result.error_map, result.identity_error_map
+    if region is not None:
+        error, identity = np.where(region, error, np.nan), np.where(region, identity, np.nan)
+    summary = summarize(error, "intensity")
+    baseline = summarize(identity, "intensity")["mean_intensity"]
+    summary["identity_mean_intensity"] = baseline
+    summary["alignment_gain"] = (
+        None if baseline is None
+        else (baseline - summary["mean_intensity"]) / (baseline + CHARBONNIER_EPSILON)
+    )
+    return summary
 
 
 def summarize_depth(result: DepthReprojection) -> dict:
@@ -92,9 +107,14 @@ def main() -> None:
     parser.add_argument("--start", type=int)
     parser.add_argument("--pairs", type=int, default=3)
     parser.add_argument("--static-dir", type=Path, help="Source-frame PNG masks. Nonzero means static.")
+    parser.add_argument(
+        "--moving-roi", nargs=5, type=int, metavar=("FRAME", "X0", "Y0", "X1", "Y1"),
+        help="Compare a manually selected moving region at one source frame (end exclusive).",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     ceiling_px = 5.0
+    rgb_ceiling = 0.1
     frames = []
     for pair in iter_frame_pairs(
         args.training, args.sequence, start=args.start, count=args.pairs, static_dir=args.static_dir,
@@ -103,6 +123,9 @@ def main() -> None:
             pair.source_depth, pair.source_camera, pair.target_camera, pair.target_depth.shape,
         )
         errors, static_errors = flow_geometry(pair, projection)
+        rgb = compute_rgb_flow_consistency(
+            pair.source_rgb, pair.target_rgb, pair.flow, pair.flow_valid, ~pair.visible,
+        )
         args.output.mkdir(parents=True, exist_ok=True)
         name = f"frame_{pair.source_id:04d}"
         row = {
@@ -112,24 +135,50 @@ def main() -> None:
             "official_visible_pixels": int(pair.visible.sum()),
             "all_valid": summarize(errors),
             "static": None,
+            "rgb_flow": {"all_valid": summarize_rgb_flow(rgb), "static": None},
             "depth_reprojection": {
                 "all_valid": depth_report(pair, projection, args.output, f"{name}_all", selected=None),
                 "static": None,
             },
         }
+        save_map(args.output / f"{name}_error.png", rgb.error_map, rgb_ceiling)
+        Image.fromarray(np.rint(np.nan_to_num(rgb.difference_map) * 255).astype(np.uint8)).save(
+            args.output / f"{name}_rgb_difference.png"
+        )
+        Image.fromarray(rgb.valid_mask.astype(np.uint8) * 255).save(
+            args.output / f"{name}_rgb_validity.png"
+        )
         save_map(args.output / f"{name}_all.png", errors, ceiling_px)
         if static_errors is not None:
             row["static"] = summarize(static_errors)
+            row["rgb_flow"]["static"] = summarize_rgb_flow(rgb, pair.static)
             row["static_mask_pixels"] = int(pair.static.sum())
             row["depth_reprojection"]["static"] = depth_report(
                 pair, projection, args.output, f"{name}_static", selected=pair.static,
             )
             save_map(args.output / f"{name}_static.png", static_errors, ceiling_px)
+        if args.moving_roi and pair.source_id == args.moving_roi[0]:
+            _, x0, y0, x1, y1 = args.moving_roi
+            height, width = rgb.valid_mask.shape
+            if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+                parser.error("--moving-roi must be a nonempty rectangle on the source image")
+            region = np.zeros_like(rgb.valid_mask)
+            region[y0:y1, x0:x1] = True
+            row["moving_roi"] = {
+                "xyxy": [x0, y0, x1, y1],
+                "flow_geometry": summarize(np.where(region, errors, np.nan)),
+                "rgb_flow": summarize_rgb_flow(rgb, region),
+            }
         frames.append(row)
+    if args.moving_roi and not any("moving_roi" in row for row in frames):
+        parser.error("--moving-roi frame is outside the evaluated source frames")
     report = {
         "sequence": args.sequence,
         "metric": "flow_geometry",
-        "metrics": ["flow_geometry", "depth_reprojection"],
+        "metrics": ["flow_geometry", "depth_reprojection", "rgb_flow"],
+        "rgb_flow_heatmap": {
+            "black": "excluded", "blue_intensity": 0, "red_intensity_at_or_above": rgb_ceiling,
+        },
         "all_valid_includes_independently_moving_objects": True,
         "heatmap": {"black": "invalid", "blue_px": 0, "red_px_at_or_above": ceiling_px},
         "depth_heatmap": {"black": "excluded", "blue_m": 0, "red_m_at_or_above": 0.1},

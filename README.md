@@ -80,3 +80,24 @@ The occlusion ratio divides occluded points by the sum of occluded and visible
 points. The visibility PNG shows those states on the source image grid.
 The all-valid depth result includes independently moving objects and should
 be interpreted alongside the static control.
+
+### Compare RGB and forward flow
+
+The report also samples target RGB at `p + F(p)` using bilinear interpolation.
+RGB is scaled to [0, 1] and scored with the mean per-channel Charbonnier
+residual (epsilon 0.001). The identity baseline samples at `p` on the same
+valid pixels. Alignment gain is `(mean_identity - mean_flow) /
+(mean_identity + 0.001)`. Moving objects participate when their
+correspondences are valid and visible. Lighting or appearance changes can
+raise the residual even with correct flow.
+
+The command writes a photometric heatmap, an absolute per-channel RGB
+difference image and a validity mask for every source frame. To reproduce the
+comparison with manually selected static masks and a moving hair region in
+`alley_1`, run:
+
+```sh
+python -m trimodalbench.sintel_eval --training data/sintel/training --sequence alley_1 --pairs 3 --static-dir data/sintel/static/alley_1 --moving-roi 3 520 155 615 255 --output reports/stage23/alley_1
+python -m trimodalbench.sintel_eval --training data/sintel/training --sequence alley_2 --pairs 3 --static-dir data/sintel/static/alley_2 --output reports/stage23/alley_2
+python -m trimodalbench.compare_reports reports/stage23/alley_1/report.json reports/stage23/alley_2/report.json --output reports/stage23/comparison
+```
